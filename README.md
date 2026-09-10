@@ -8,12 +8,21 @@
 
 ---
 
+## 界面预览
+
+![Memory Optimizer 界面](screenshot.png)
+
+现代卡片式布局：无边框圆角窗口、实时内存进度条、状态徽章、扁平化按钮，清晰分区。
+
+---
+
 ## 功能特性
 
 - **一键清理内存**：遍历所有可访问进程，调用 `SetProcessWorkingSetSizeEx` 压缩工作集，并显示本次腾出的内存量
 - **实时内存监控**：可用/已用/总内存 + 占用率进度条，每 10 秒自动刷新
 - **定时清理**：间隔 **1~720 分钟可自定义**，后台静默运行，支持开机自启，关闭窗口不影响
 - **运行日志**：记录每次清理的时间、成功/跳过进程数、腾出内存
+- **现代 UI**：无边框圆角窗口、卡片布局、主色按钮与状态徽章，高分屏 DPI 感知
 - **纯脚本零依赖**：仅使用 Windows 自带的 PowerShell 5.1+ 和 .NET 框架，无需安装任何东西
 
 ---
@@ -82,6 +91,7 @@ powershell -ExecutionPolicy Bypass -File .\memory-tool.ps1 -schedule -Minutes 15
 
 ```text
 memory-tool.ps1   主程序（GUI + 命令行双模式）
+screenshot.png    界面预览图
 README.md         本文档
 LICENSE           开源协议
 ```
