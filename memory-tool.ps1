@@ -16,6 +16,8 @@
 #     -stop          : 命令行关闭定时清理
 #     -deepclean     : PCL 模式深度优化一次（需管理员，7 项系统级操作）
 # ============================================
+# v1.3.1 修复：定时清理「关闭」按钮不再因 WMI 快照延迟被置灰，始终可点；
+#            开启/关闭/应用间隔后延迟刷新状态，界面每 10 秒自动同步定时状态。
 
 param(
     [switch]$Info,
@@ -628,22 +630,23 @@ function Refresh-Memory {
 }
 
 function Refresh-TimerStatus {
-    $running = (Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object {
+    # 双保险检测：进程 + 启动项；@() 保证结果一定是数组（避免单对象/空结果的 Count 陷阱）
+    $watchProc = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object {
         $_.CommandLine -like '*memory-tool.ps1*' -and $_.CommandLine -like '*-watch*'
-    }).Count -gt 0
+    })
+    $running = $watchProc.Count -gt 0
     $autostart = Test-Path $timerLnk
     if ($running) {
         $lblBadge.Text = "● 运行中"
         $lblBadge.ForeColor = $cGreen
-        $btnTimerOn.Enabled  = $false
-        $btnTimerOff.Enabled = $true
         if (-not $autostart) { $lblBadge.Text = "● 运行中（自启缺失）" }
     } else {
         $lblBadge.Text = "● 未开启"
         $lblBadge.ForeColor = $cGray
-        $btnTimerOn.Enabled  = $true
-        $btnTimerOff.Enabled = $false
     }
+    # 开启按钮仅在未运行时可用；关闭按钮始终可用（幂等清理，避免 WMI 延迟导致按钮置灰点不了）
+    $btnTimerOn.Enabled  = -not $running
+    $btnTimerOff.Enabled = $true
 }
 
 $btnClean.Add_Click({
@@ -690,23 +693,31 @@ $btnTimerOn.Add_Click({
     $sc.WorkingDirectory = Split-Path $scriptPath
     $sc.Save()
     Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-File',"`"$scriptPath`"",'-watch','-Minutes',"$m" -WindowStyle Hidden
-    Refresh-TimerStatus
     Add-Log "定时清理已开启（每 $m 分钟静默清理，开机自启）"
+    # 延迟刷新：WMI 进程快照有延迟，立即查询可能查不到刚启动的后台进程
+    $st = New-Object System.Windows.Forms.Timer
+    $st.Interval = 1500
+    $st.Add_Tick({ $st.Stop(); Refresh-TimerStatus })
+    $st.Start()
 })
 
 $btnTimerOff.Add_Click({
     Stop-TimerProcess
     if (Test-Path $timerLnk) { Remove-Item $timerLnk -Force }
-    Refresh-TimerStatus
     Add-Log "定时清理已关闭"
+    # 延迟刷新：避免 WMI 缓存残留导致刚杀掉的进程仍被检测到
+    $st = New-Object System.Windows.Forms.Timer
+    $st.Interval = 800
+    $st.Add_Tick({ $st.Stop(); Refresh-TimerStatus })
+    $st.Start()
 })
 
 $btnApply.Add_Click({
     $m = [int]$nudMinutes.Value
-    $running = (Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object {
+    $watchProc = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object {
         $_.CommandLine -like '*memory-tool.ps1*' -and $_.CommandLine -like '*-watch*'
-    }).Count -gt 0
-    if ($running) {
+    })
+    if ($watchProc.Count -gt 0) {
         Stop-TimerProcess
         $ws = New-Object -ComObject WScript.Shell
         $sc = $ws.CreateShortcut($timerLnk)
@@ -715,8 +726,12 @@ $btnApply.Add_Click({
         $sc.WorkingDirectory = Split-Path $scriptPath
         $sc.Save()
         Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-File',"`"$scriptPath`"",'-watch','-Minutes',"$m" -WindowStyle Hidden
-        Refresh-TimerStatus
         Add-Log "定时间隔已改为 $m 分钟（后台已按新间隔重启）"
+        # 延迟刷新，避开 WMI 快照延迟
+        $st = New-Object System.Windows.Forms.Timer
+        $st.Interval = 1500
+        $st.Add_Tick({ $st.Stop(); Refresh-TimerStatus })
+        $st.Start()
     } else {
         Add-Log "定时间隔已设为 $m 分钟（开启定时时生效）"
     }
@@ -736,7 +751,7 @@ $form.Add_Shown({
 
 $uiTimer = New-Object System.Windows.Forms.Timer
 $uiTimer.Interval = 10000
-$uiTimer.Add_Tick({ Refresh-Memory })
+$uiTimer.Add_Tick({ Refresh-Memory; Refresh-TimerStatus })
 $uiTimer.Start()
 
 [System.Windows.Forms.Application]::Run($form)
