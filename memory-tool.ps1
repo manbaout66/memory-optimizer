@@ -14,6 +14,7 @@
 #     -info          : 弹出当前内存状态
 #     -schedule [分钟] : 命令行开启定时清理
 #     -stop          : 命令行关闭定时清理
+#     -deepclean     : PCL 模式深度优化一次（需管理员，7 项系统级操作）
 # ============================================
 
 param(
@@ -22,6 +23,7 @@ param(
     [switch]$Stop,
     [switch]$Watch,
     [switch]$Silent,
+    [switch]$DeepClean,
     [int]$Minutes = 30
 )
 
@@ -38,6 +40,74 @@ public class MemOptimizer {
         UIntPtr dwMinimumWorkingSetSize,
         UIntPtr dwMaximumWorkingSetSize,
         uint dwFlags);
+
+    // PCL 深度优化核心：NT 内核系统信息调用
+    [DllImport("ntdll.dll")]
+    public static extern uint NtSetSystemInformation(int SystemInformationClass, IntPtr SystemInformation, int SystemInformationLength);
+
+    // 标准特权启用（advapi32）：行为稳定，比 RtlAdjustPrivilege 可靠
+    [DllImport("advapi32.dll", SetLastError = true)]
+    public static extern bool OpenProcessToken(IntPtr ProcessHandle, uint DesiredAccess, out IntPtr TokenHandle);
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern bool LookupPrivilegeValue(string lpSystemName, string lpName, out LUID lpLuid);
+    [DllImport("advapi32.dll", SetLastError = true)]
+    public static extern bool AdjustTokenPrivileges(IntPtr TokenHandle, bool DisableAllPrivileges, ref TOKEN_PRIVILEGES NewState, uint BufferLength, IntPtr PreviousState, IntPtr ReturnLength);
+    [DllImport("kernel32.dll")]
+    public static extern IntPtr GetCurrentProcess();
+
+    // SystemInformationClass（来自 PCL NtInterop）
+    public const int SystemMemoryListInformation = 80;               // 内存列表操作（清工作集/修改页/待机页）
+    public const int SystemFileCacheInformationEx = 81;              // 文件缓存
+    public const int SystemCombinePhysicalMemoryInformation = 130;   // 合并物理内存
+    public const int SystemRegistryReconciliationInformation = 155;  // 注册表对账
+
+    public const uint TOKEN_ADJUST_PRIVILEGES = 0x20;
+    public const uint TOKEN_QUERY = 0x8;
+    public const uint SE_PRIVILEGE_ENABLED = 0x2;
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct LUID { public uint LowPart; public int HighPart; }
+    [StructLayout(LayoutKind.Sequential)]
+    public struct TOKEN_PRIVILEGES { public uint PrivilegeCount; public LUID Luid; public uint Attributes; }
+
+    public static uint EnablePrivilege(string privilegeName) {
+        IntPtr token;
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, out token)) {
+            return (uint)Marshal.GetLastWin32Error();
+        }
+        LUID luid;
+        if (!LookupPrivilegeValue(null, privilegeName, out luid)) {
+            return (uint)Marshal.GetLastWin32Error();
+        }
+        TOKEN_PRIVILEGES tp = new TOKEN_PRIVILEGES();
+        tp.PrivilegeCount = 1;
+        tp.Luid = luid;
+        tp.Attributes = SE_PRIVILEGE_ENABLED;
+        bool ok = AdjustTokenPrivileges(token, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero);
+        uint err = (uint)Marshal.GetLastWin32Error();
+        if (!ok) return err;
+        return err == 0 ? 0 : err;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct SYSTEM_FILECACHE_INFORMATION {
+        public UIntPtr CurrentSize;
+        public UIntPtr PeakSize;
+        public UIntPtr PageFaultCount;
+        public UIntPtr MinimumWorkingSet;
+        public UIntPtr MaximumWorkingSet;
+        public UIntPtr CurrentSizeIncludingTransitionInPages;
+        public UIntPtr PeakSizeIncludingTransitionInPages;
+        public UIntPtr TransitionRePurposeCount;
+        public UIntPtr Flags;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MEMORY_COMBINE_INFORMATION_EX {
+        public IntPtr Handle;
+        public UIntPtr PagesCombined;
+        public uint Flags;
+    }
 }
 public class Win32UI {
     [DllImport("gdi32.dll")]
@@ -85,6 +155,81 @@ function Clear-WorkingSet {
     return @{ Cleaned = $cleaned; Skipped = $skipped }
 }
 
+# 当前进程是否管理员（深度优化需要）
+function Test-IsAdmin {
+    $p = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+    return $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+# 启用深度优化所需的内核权限（需管理员令牌）
+function Enable-MemPrivileges {
+    $null = [MemOptimizer]::EnablePrivilege("SeProfileSingleProcessPrivilege")
+    $null = [MemOptimizer]::EnablePrivilege("SeIncreaseQuotaPrivilege")
+}
+
+# 内存列表操作：2=清空工作集 3=刷新修改页 4=清除备用页 5=清除低优先级备用页
+function Invoke-MemoryListOp([int]$op) {
+    $bytes = [BitConverter]::GetBytes($op)
+    $ptr = [Runtime.InteropServices.Marshal]::AllocHGlobal(4)
+    try {
+        [Runtime.InteropServices.Marshal]::Copy($bytes, 0, $ptr, 4)
+        $null = [MemOptimizer]::NtSetSystemInformation([MemOptimizer]::SystemMemoryListInformation, $ptr, 4)
+    } finally {
+        [Runtime.InteropServices.Marshal]::FreeHGlobal($ptr)
+    }
+}
+
+# PCL 深度优化：7 个系统级操作（需管理员）
+# 返回腾出的可用内存 MB
+function Invoke-PclDeepClean {
+    Enable-MemPrivileges
+    $before = (Get-MemoryMB).Free
+
+    # 1. 清空所有进程工作集（系统级）
+    Invoke-MemoryListOp 2
+
+    # 2. 刷新文件缓存（把文件缓存页强制换出）
+    $scfi = New-Object MemOptimizer+SYSTEM_FILECACHE_INFORMATION
+    $scfi.MaximumWorkingSet = [UIntPtr]::new([uint64]::MaxValue)
+    $scfi.MinimumWorkingSet = [UIntPtr]::new([uint64]::MaxValue)
+    $sz1 = [Runtime.InteropServices.Marshal]::SizeOf($scfi)
+    $ptr1 = [Runtime.InteropServices.Marshal]::AllocHGlobal($sz1)
+    try {
+        [Runtime.InteropServices.Marshal]::StructureToPtr($scfi, $ptr1, $false)
+        $null = [MemOptimizer]::NtSetSystemInformation([MemOptimizer]::SystemFileCacheInformationEx, $ptr1, $sz1)
+    } finally {
+        [Runtime.InteropServices.Marshal]::FreeHGlobal($ptr1)
+    }
+
+    # 3. 刷新修改页列表（脏页写回磁盘）
+    Invoke-MemoryListOp 3
+
+    # 4. 清除备用页列表（standby 缓存 —— 可用内存大幅提升的关键）
+    Invoke-MemoryListOp 4
+
+    # 5. 清除低优先级备用页
+    Invoke-MemoryListOp 5
+
+    # 6. 注册表对账
+    $null = [MemOptimizer]::NtSetSystemInformation([MemOptimizer]::SystemRegistryReconciliationInformation, [IntPtr]::Zero, 0)
+
+    # 7. 合并物理内存页（内存压缩）
+    $comb = New-Object MemOptimizer+MEMORY_COMBINE_INFORMATION_EX
+    $sz2 = [Runtime.InteropServices.Marshal]::SizeOf($comb)
+    $ptr2 = [Runtime.InteropServices.Marshal]::AllocHGlobal($sz2)
+    try {
+        [Runtime.InteropServices.Marshal]::StructureToPtr($comb, $ptr2, $false)
+        $null = [MemOptimizer]::NtSetSystemInformation([MemOptimizer]::SystemCombinePhysicalMemoryInformation, $ptr2, $sz2)
+    } finally {
+        [Runtime.InteropServices.Marshal]::FreeHGlobal($ptr2)
+    }
+
+    [GC]::Collect()
+    Start-Sleep -Milliseconds 600
+    $after = (Get-MemoryMB).Free
+    return [math]::Max(0, $after - $before)
+}
+
 # 弹出提示框（seconds 秒后自动关闭）
 function Show-Popup($text, $seconds) {
     $ws = New-Object -ComObject WScript.Shell
@@ -106,6 +251,17 @@ $startupDir = [Environment]::GetFolderPath('Startup')
 $timerLnk   = Join-Path $startupDir '内存定时清理.lnk'
 
 # ---------- 命令行模式 ----------
+
+# 深度优化一次（PCL 模式，需管理员；由 GUI 提权调用或命令行手动执行）
+if ($DeepClean) {
+    if (-not (Test-IsAdmin)) {
+        Show-Popup "深度优化需要管理员权限，请以管理员身份运行", 5
+        exit 1
+    }
+    $freed = Invoke-PclDeepClean
+    Show-Popup "深度优化完成，腾出 $freed MB 可用内存", 6
+    exit
+}
 
 # 静默清理一次（给后台定时任务用）
 if ($Silent) {
@@ -271,7 +427,7 @@ $lblTitle.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 11, [Syste
 $lblVersion = New-Object System.Windows.Forms.Label
 $lblVersion.Location = New-Object System.Drawing.Point(155, 19)
 $lblVersion.Size = New-Object System.Drawing.Size(60, 16)
-$lblVersion.Text = "v1.2"
+$lblVersion.Text = "v1.3"
 $lblVersion.ForeColor = $cSub
 $lblVersion.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 8)
 
@@ -492,15 +648,36 @@ function Refresh-TimerStatus {
 
 $btnClean.Add_Click({
     $btnClean.Enabled = $false
-    $btnClean.Text    = "清理中..."
-    $before = Get-MemoryMB
-    $r = Clear-WorkingSet
-    $after  = Get-MemoryMB
-    $freed  = $after.Free - $before.Free
-    Add-Log ("清理完成：成功 " + $r.Cleaned + " 个进程，跳过 " + $r.Skipped + " 个，腾出 " + $freed + " MB")
-    Refresh-Memory
-    $btnClean.Text    = "一键清理内存"
-    $btnClean.Enabled = $true
+    $btnClean.Text    = "优化中..."
+    if (Test-IsAdmin) {
+        # 已是管理员：直接执行 PCL 深度优化
+        $freed = Invoke-PclDeepClean
+        Add-Log ("深度优化完成：腾出 " + $freed + " MB（清工作集+文件缓存+待机页+内存合并）")
+        Refresh-Memory
+        $btnClean.Text    = "一键清理内存"
+        $btnClean.Enabled = $true
+    } else {
+        # 普通权限：请求提权执行深度优化
+        Add-Log "深度优化需要管理员权限，正在请求提权（UAC 弹窗请点“是”）..."
+        try {
+            Start-Process powershell -Verb RunAs -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$scriptPath`"",'-deepclean' -WindowStyle Hidden | Out-Null
+            Add-Log "已提交深度优化，完成后将自动刷新"
+        } catch {
+            Add-Log "提权被取消，已回退为普通清理"
+            $r = Clear-WorkingSet
+            Add-Log ("普通清理：成功 " + $r.Cleaned + " 个进程，跳过 " + $r.Skipped + " 个")
+        }
+        # 3 秒后刷新内存读数并恢复按钮（给提权进程留出执行时间）
+        $rf = New-Object System.Windows.Forms.Timer
+        $rf.Interval = 3000
+        $rf.Add_Tick({
+            $rf.Stop()
+            Refresh-Memory
+            $btnClean.Text    = "一键清理内存"
+            $btnClean.Enabled = $true
+        })
+        $rf.Start()
+    }
 })
 
 $btnTimerOn.Add_Click({
