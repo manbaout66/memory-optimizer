@@ -16,8 +16,8 @@
 #     -stop          : 命令行关闭定时清理
 #     -deepclean     : PCL 模式深度优化一次（需管理员，7 项系统级操作）
 # ============================================
-# v1.3.1 修复：定时清理「关闭」按钮不再因 WMI 快照延迟被置灰，始终可点；
-#            开启/关闭/应用间隔后延迟刷新状态，界面每 10 秒自动同步定时状态。
+# v1.3.2 修复：修复 Timer 事件回调变量解析导致"不能对Null表达式调用方法"异常弹窗
+#            （GetNewClosure 显式闭包 + 全局异常捕获写日志 + 全链路 null 防御 + Clear-WorkingSet return bug）
 
 param(
     [switch]$Info,
@@ -125,12 +125,17 @@ public class Win32UI {
 
 # ---------- 基础函数 ----------
 
-# 获取当前物理内存状态（MB）
+# 获取当前物理内存状态（MB）；CIM 查询失败时返回 0 兜底，绝不让调用方拿到 null
 function Get-MemoryMB {
     $os = Get-CimInstance Win32_OperatingSystem
+    if (-not $os) { return @{ Free = 0; Total = 0 } }
+    $free  = $os.FreePhysicalMemory
+    $total = $os.TotalVisibleMemorySize
+    if ($null -eq $free)  { $free = 0 }
+    if ($null -eq $total) { $total = 0 }
     return @{
-        Free  = [math]::Round($os.FreePhysicalMemory / 1024)
-        Total = [math]::Round($os.TotalVisibleMemorySize / 1024)
+        Free  = [math]::Round([double]$free / 1024)
+        Total = [math]::Round([double]$total / 1024)
     }
 }
 
@@ -140,17 +145,19 @@ function Clear-WorkingSet {
     $skipped = 0
     $me = $PID
     Get-Process | ForEach-Object {
-        if ($_.Id -eq $me) { return }
-        try {
-            $handle = $_.Handle
-            $ok = [MemOptimizer]::SetProcessWorkingSetSizeEx(
-                $handle,
-                [UIntPtr]::new([uint64]::MaxValue),
-                [UIntPtr]::new([uint64]::MaxValue),
-                0)
-            if ($ok) { $cleaned++ } else { $skipped++ }
-        } catch {
-            $skipped++
+        # 注意：不能在此 scriptblock 中使用 return/continue（PS 5.1 会提前退出函数或报错），用 if 包裹
+        if ($_.Id -ne $me) {
+            try {
+                $handle = $_.Handle
+                $ok = [MemOptimizer]::SetProcessWorkingSetSizeEx(
+                    $handle,
+                    [UIntPtr]::new([uint64]::MaxValue),
+                    [UIntPtr]::new([uint64]::MaxValue),
+                    0)
+                if ($ok) { $cleaned++ } else { $skipped++ }
+            } catch {
+                $skipped++
+            }
         }
     }
     [GC]::Collect()
@@ -241,7 +248,7 @@ function Show-Popup($text, $seconds) {
 # 停止正在运行的定时清理后台进程
 function Stop-TimerProcess {
     Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object {
-        $_.CommandLine -like '*memory-tool.ps1*' -and $_.CommandLine -like '*-watch*'
+        $_.CommandLine -and $_.CommandLine -like '*memory-tool.ps1*' -and $_.CommandLine -like '*-watch*'
     } | ForEach-Object {
         Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
     }
@@ -320,6 +327,20 @@ if ($Info) {
 # ============================================
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+
+# 全局异常捕获：GUI 线程未处理异常写日志文件（带完整堆栈，便于定位）
+$errLogPath = Join-Path (Split-Path $scriptPath) 'memory-tool-error.log'
+try {
+    [System.Windows.Forms.Application]::SetUnhandledExceptionMode([System.Windows.Forms.UnhandledExceptionMode]::CatchException)
+    [System.Windows.Forms.Application]::add_ThreadException({
+        param($sender, $e)
+        try { Add-Content -Path $errLogPath -Value ("[" + (Get-Date -Format "yyyy-MM-dd HH:mm:ss") + "] " + $e.Exception.ToString()) -Encoding UTF8 } catch {}
+    })
+    [AppDomain]::CurrentDomain.add_UnhandledException({
+        param($sender, $e)
+        try { Add-Content -Path $errLogPath -Value ("[DOMAIN " + (Get-Date -Format "yyyy-MM-dd HH:mm:ss") + "] " + $e.ExceptionObject.ToString()) -Encoding UTF8 } catch {}
+    })
+} catch {}
 
 # 必须在创建任何窗口前启用 DPI 感知，保证逻辑/物理坐标一致
 $null = [Win32UI]::SetProcessDPIAware()
@@ -429,7 +450,7 @@ $lblTitle.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 11, [Syste
 $lblVersion = New-Object System.Windows.Forms.Label
 $lblVersion.Location = New-Object System.Drawing.Point(155, 19)
 $lblVersion.Size = New-Object System.Drawing.Size(60, 16)
-$lblVersion.Text = "v1.3"
+$lblVersion.Text = "v1.3.2"
 $lblVersion.ForeColor = $cSub
 $lblVersion.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 8)
 
@@ -614,25 +635,30 @@ $form.Controls.Add($cardLog)
 # ---------- 逻辑 ----------
 
 function Add-Log($msg) {
-    $txtLog.AppendText("[" + (Get-Date -Format "HH:mm:ss") + "] " + $msg + "`r`n")
-    $txtLog.SelectionStart = $txtLog.TextLength
-    $txtLog.ScrollToCaret()
+    if (-not $txtLog) { return }
+    try {
+        $txtLog.AppendText("[" + (Get-Date -Format "HH:mm:ss") + "] " + $msg + "`r`n")
+        $txtLog.SelectionStart = $txtLog.TextLength
+        $txtLog.ScrollToCaret()
+    } catch {}
 }
 
 function Refresh-Memory {
     $m = Get-MemoryMB
+    if (-not $m -or $null -eq $m.Free -or $null -eq $m.Total) { $m = @{ Free = 0; Total = 0 } }
     $used = $m.Total - $m.Free
-    $pct  = [math]::Round($used / $m.Total * 100)
+    $pct  = 0
+    if ($m.Total -gt 0) { $pct = [math]::Round($used / $m.Total * 100) }
     $script:uiPct = $pct
-    $lblFreeBig.Text = $m.Free.ToString("N0") + " MB"
-    $lblDetail.Text  = "总计 " + $m.Total.ToString("N0") + " MB  ｜  已用 " + $used.ToString("N0") + " MB (" + $pct + "%)"
+    $lblFreeBig.Text = ([double]$m.Free).ToString("N0") + " MB"
+    $lblDetail.Text  = "总计 " + ([double]$m.Total).ToString("N0") + " MB  ｜  已用 " + ([double]$used).ToString("N0") + " MB (" + $pct + "%)"
     $prgPanel.Invalidate()
 }
 
 function Refresh-TimerStatus {
     # 双保险检测：进程 + 启动项；@() 保证结果一定是数组（避免单对象/空结果的 Count 陷阱）
     $watchProc = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object {
-        $_.CommandLine -like '*memory-tool.ps1*' -and $_.CommandLine -like '*-watch*'
+        $_.CommandLine -and $_.CommandLine -like '*memory-tool.ps1*' -and $_.CommandLine -like '*-watch*'
     })
     $running = $watchProc.Count -gt 0
     $autostart = Test-Path $timerLnk
@@ -652,52 +678,77 @@ function Refresh-TimerStatus {
 $btnClean.Add_Click({
     $btnClean.Enabled = $false
     $btnClean.Text    = "优化中..."
-    if (Test-IsAdmin) {
-        # 已是管理员：直接执行 PCL 深度优化
-        $freed = Invoke-PclDeepClean
-        Add-Log ("深度优化完成：腾出 " + $freed + " MB（清工作集+文件缓存+待机页+内存合并）")
-        Refresh-Memory
-        $btnClean.Text    = "一键清理内存"
-        $btnClean.Enabled = $true
-    } else {
-        # 普通权限：请求提权执行深度优化
-        Add-Log "深度优化需要管理员权限，正在请求提权（UAC 弹窗请点“是”）..."
-        try {
-            Start-Process powershell -Verb RunAs -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$scriptPath`"",'-deepclean' -WindowStyle Hidden | Out-Null
-            Add-Log "已提交深度优化，完成后将自动刷新"
-        } catch {
-            Add-Log "提权被取消，已回退为普通清理"
-            $r = Clear-WorkingSet
-            Add-Log ("普通清理：成功 " + $r.Cleaned + " 个进程，跳过 " + $r.Skipped + " 个")
-        }
-        # 3 秒后刷新内存读数并恢复按钮（给提权进程留出执行时间）
-        $rf = New-Object System.Windows.Forms.Timer
-        $rf.Interval = 3000
-        $rf.Add_Tick({
-            $rf.Stop()
+    try {
+        if (Test-IsAdmin) {
+            # 已是管理员：直接执行 PCL 深度优化
+            $freed = Invoke-PclDeepClean
+            Add-Log ("深度优化完成：腾出 " + $freed + " MB（清工作集+文件缓存+待机页+内存合并）")
             Refresh-Memory
             $btnClean.Text    = "一键清理内存"
             $btnClean.Enabled = $true
-        })
-        $rf.Start()
+        } else {
+            # 普通权限：请求提权执行深度优化
+            Add-Log "深度优化需要管理员权限，正在请求提权（UAC 弹窗请点“是”）..."
+            try {
+                Start-Process powershell -Verb RunAs -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$scriptPath`"",'-deepclean' -WindowStyle Hidden | Out-Null
+                Add-Log "已提交深度优化，完成后将自动刷新"
+            } catch {
+                Add-Log "提权被取消，已回退为普通清理"
+                $r = Clear-WorkingSet
+                if ($r) {
+                    Add-Log ("普通清理：成功 " + $r.Cleaned + " 个进程，跳过 " + $r.Skipped + " 个")
+                } else {
+                    Add-Log "普通清理完成"
+                }
+            }
+            # 3 秒后刷新内存读数并恢复按钮（给提权进程留出执行时间）
+            # 注意：Add_Tick 回调必须 GetNewClosure() 显式闭包捕获 $rf，
+            # 否则 PowerShell 5.1 事件回调可能解析不到局部变量（$rf=$null → $null.Stop() 报"不能对Null值表达式调用方法"）
+            $rf = New-Object System.Windows.Forms.Timer
+            $rf.Interval = 3000
+            $rf.Add_Tick({
+                try {
+                    $rf.Stop()
+                    Refresh-Memory
+                } catch {
+                    try { Add-Content -Path $errLogPath -Value ("[RF " + (Get-Date -Format "yyyy-MM-dd HH:mm:ss") + "] " + $_.Exception.ToString()) -Encoding UTF8 } catch {}
+                }
+                # 无论是否异常都恢复按钮，避免卡在"优化中..."
+                $btnClean.Text    = "一键清理内存"
+                $btnClean.Enabled = $true
+            }.GetNewClosure())
+            $rf.Start()
+        }
+    } catch {
+        # 事件级兜底：任何未预期异常写入错误日志并恢复按钮
+        try { Add-Content -Path $errLogPath -Value ("[CLEAN " + (Get-Date -Format "yyyy-MM-dd HH:mm:ss") + "] " + $_.Exception.ToString()) -Encoding UTF8 } catch {}
+        Add-Log ("一键清理异常：" + $_.Exception.Message)
+        $btnClean.Text    = "一键清理内存"
+        $btnClean.Enabled = $true
     }
 })
 
 $btnTimerOn.Add_Click({
     $m = [int]$nudMinutes.Value
     Stop-TimerProcess
-    $ws = New-Object -ComObject WScript.Shell
-    $sc = $ws.CreateShortcut($timerLnk)
-    $sc.TargetPath = 'powershell.exe'
-    $sc.Arguments  = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" -watch -Minutes $m"
-    $sc.WorkingDirectory = Split-Path $scriptPath
-    $sc.Save()
+    try {
+        $ws = New-Object -ComObject WScript.Shell
+        $sc = $ws.CreateShortcut($timerLnk)
+        if (-not $sc) { throw "创建快捷方式失败" }
+        $sc.TargetPath = 'powershell.exe'
+        $sc.Arguments  = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" -watch -Minutes $m"
+        $sc.WorkingDirectory = Split-Path $scriptPath
+        $sc.Save()
+    } catch {
+        Add-Log ("开启失败：" + $_.Exception.Message)
+        return
+    }
     Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-File',"`"$scriptPath`"",'-watch','-Minutes',"$m" -WindowStyle Hidden
     Add-Log "定时清理已开启（每 $m 分钟静默清理，开机自启）"
     # 延迟刷新：WMI 进程快照有延迟，立即查询可能查不到刚启动的后台进程
     $st = New-Object System.Windows.Forms.Timer
     $st.Interval = 1500
-    $st.Add_Tick({ $st.Stop(); Refresh-TimerStatus })
+    $st.Add_Tick({ $st.Stop(); Refresh-TimerStatus }.GetNewClosure())
     $st.Start()
 })
 
@@ -708,29 +759,35 @@ $btnTimerOff.Add_Click({
     # 延迟刷新：避免 WMI 缓存残留导致刚杀掉的进程仍被检测到
     $st = New-Object System.Windows.Forms.Timer
     $st.Interval = 800
-    $st.Add_Tick({ $st.Stop(); Refresh-TimerStatus })
+    $st.Add_Tick({ $st.Stop(); Refresh-TimerStatus }.GetNewClosure())
     $st.Start()
 })
 
 $btnApply.Add_Click({
     $m = [int]$nudMinutes.Value
     $watchProc = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object {
-        $_.CommandLine -like '*memory-tool.ps1*' -and $_.CommandLine -like '*-watch*'
+        $_.CommandLine -and $_.CommandLine -like '*memory-tool.ps1*' -and $_.CommandLine -like '*-watch*'
     })
     if ($watchProc.Count -gt 0) {
         Stop-TimerProcess
-        $ws = New-Object -ComObject WScript.Shell
-        $sc = $ws.CreateShortcut($timerLnk)
-        $sc.TargetPath = 'powershell.exe'
-        $sc.Arguments  = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" -watch -Minutes $m"
-        $sc.WorkingDirectory = Split-Path $scriptPath
-        $sc.Save()
+        try {
+            $ws = New-Object -ComObject WScript.Shell
+            $sc = $ws.CreateShortcut($timerLnk)
+            if (-not $sc) { throw "创建快捷方式失败" }
+            $sc.TargetPath = 'powershell.exe'
+            $sc.Arguments  = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" -watch -Minutes $m"
+            $sc.WorkingDirectory = Split-Path $scriptPath
+            $sc.Save()
+        } catch {
+            Add-Log ("应用间隔失败：" + $_.Exception.Message)
+            return
+        }
         Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-File',"`"$scriptPath`"",'-watch','-Minutes',"$m" -WindowStyle Hidden
         Add-Log "定时间隔已改为 $m 分钟（后台已按新间隔重启）"
         # 延迟刷新，避开 WMI 快照延迟
         $st = New-Object System.Windows.Forms.Timer
         $st.Interval = 1500
-        $st.Add_Tick({ $st.Stop(); Refresh-TimerStatus })
+        $st.Add_Tick({ $st.Stop(); Refresh-TimerStatus }.GetNewClosure())
         $st.Start()
     } else {
         Add-Log "定时间隔已设为 $m 分钟（开启定时时生效）"
@@ -740,7 +797,7 @@ $btnApply.Add_Click({
 $form.Add_Shown({
     if (Test-Path $timerLnk) {
         $sc = (New-Object -ComObject WScript.Shell).CreateShortcut($timerLnk)
-        if ($sc.Arguments -match '-Minutes (\d+)') {
+        if ($sc -and $sc.Arguments -match '-Minutes (\d+)') {
             $nudMinutes.Value = [math]::Min(720, [math]::Max(1, [int]$matches[1]))
         }
     }
